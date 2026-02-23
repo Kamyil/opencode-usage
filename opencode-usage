@@ -20,6 +20,7 @@ Options:
   --cache-write-rate NUM    Cost per 1M cache write tokens
   --currency SYMBOL         Currency symbol for cost output (default: $)
   --by-model                Show token breakdown by model/provider per category
+  --tools                   Show tool usage breakdown per category
   --pretty                  Pretty-print output with box drawing and bars
   --help                    Show this help
 
@@ -209,6 +210,7 @@ declare -A CATEGORY_PREFIXES
 CATEGORY_NAMES=()
 PRETTY=false
 BY_MODEL=false
+SHOW_TOOLS=false
 
 INPUT_RATE=""
 OUTPUT_RATE=""
@@ -278,6 +280,10 @@ while [[ $# -gt 0 ]]; do
 			;;
 		--by-model)
 			BY_MODEL=true
+			shift
+			;;
+		--tools)
+			SHOW_TOOLS=true
 			shift
 			;;
 		--help|-h)
@@ -495,6 +501,25 @@ order by c.bucket, sum(c.input_tokens + c.output_tokens + c.reasoning_tokens) de
 "
 fi
 
+TOOLS_QUERY=""
+if [[ "$SHOW_TOOLS" == true ]]; then
+	TOOLS_QUERY="
+select '---TOOLS';
+select c.bucket || char(9) ||
+       coalesce(json_extract(p.data, '$.tool'), 'unknown') || char(9) ||
+       count(*) || char(9) ||
+       round(100.0 * count(*) /
+         nullif(sum(count(*)) over (partition by c.bucket), 0), 1)
+from categorized c
+join part p on p.session_id = c.session_id
+where json_extract(p.data, '$.type') = 'tool'
+  and p.time_created >= (strftime('%s','$MONTH_START')*1000)
+  and p.time_created < (strftime('%s','$MONTH_END')*1000)
+group by c.bucket, coalesce(json_extract(p.data, '$.tool'), 'unknown')
+order by c.bucket, count(*) desc;
+"
+fi
+
 ALL_DATA=$(sqlite3 "$DB_PATH" "
 $MATERIALIZE_SQL
 
@@ -544,6 +569,8 @@ order by sum(input_tokens+output_tokens+reasoning_tokens) desc;
 $COST_QUERY
 
 $MODEL_QUERY
+
+$TOOLS_QUERY
 ")
 
 ## --- Parse the combined output into sections ---
@@ -553,6 +580,7 @@ PCT_DATA=""
 SUMMARY_DATA=""
 COST_DATA=""
 MODEL_DATA=""
+TOOLS_DATA=""
 declare -A PROJECT_DATA_MAP
 CURRENT_SECTION=""
 
@@ -564,6 +592,7 @@ while IFS= read -r line; do
 		---SUMMARY) CURRENT_SECTION="summary"; continue ;;
 		---COST) CURRENT_SECTION="cost"; continue ;;
 		---MODELS) CURRENT_SECTION="models"; continue ;;
+		---TOOLS) CURRENT_SECTION="tools"; continue ;;
 	esac
 	case "$CURRENT_SECTION" in
 		overview)
@@ -592,6 +621,10 @@ while IFS= read -r line; do
 		models)
 			[[ -n "$MODEL_DATA" ]] && MODEL_DATA+=$'\n'
 			MODEL_DATA+="$line"
+			;;
+		tools)
+			[[ -n "$TOOLS_DATA" ]] && TOOLS_DATA+=$'\n'
+			TOOLS_DATA+="$line"
 			;;
 	esac
 done <<< "$ALL_DATA"
@@ -723,6 +756,30 @@ if [[ -n "$MODEL_DATA" ]]; then
 		printf '\nModel breakdown\n'
 		printf '%s\n' "$MODEL_DATA" | (
 			printf 'bucket\tmodel\tinput_tokens\toutput_tokens\treasoning_tokens\ttotal_tokens\tsessions\tmessages\tpct\n'
+			cat
+		) | format_table
+	fi
+fi
+
+if [[ -n "$TOOLS_DATA" ]]; then
+	if [[ "$PRETTY" == true ]]; then
+		section_header "Tool Usage"
+		local_last_bucket=""
+		while IFS=$'\t' read -r bucket tool_name call_count pct; do
+			if [[ "$bucket" != "$local_last_bucket" ]]; then
+				printf '\n  %s%s%s\n' "$BOLD" "$bucket" "$RESET"
+				printf '  %-25s %10s %7s\n' \
+					"${DIM}Tool${RESET}" "${DIM}Calls${RESET}" "${DIM}   %${RESET}"
+				local_last_bucket="$bucket"
+			fi
+			printf '  %-25s %10s %6s%%\n' \
+				"$tool_name" "$(format_number "$call_count")" "$pct"
+		done <<< "$TOOLS_DATA"
+		printf '\n'
+	else
+		printf '\nTool usage\n'
+		printf '%s\n' "$TOOLS_DATA" | (
+			printf 'bucket\ttool\tcalls\tpct\n'
 			cat
 		) | format_table
 	fi
