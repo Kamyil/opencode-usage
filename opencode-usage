@@ -22,6 +22,7 @@ Options:
   --by-model                Show token breakdown by model/provider per category
   --tools                   Show tool usage breakdown per category
   --diff-stats              Show lines of code added/deleted per category
+  --time-stats              Show session duration and time-of-day analysis
   --pretty                  Pretty-print output with box drawing and bars
   --help                    Show this help
 
@@ -213,6 +214,7 @@ PRETTY=false
 BY_MODEL=false
 SHOW_TOOLS=false
 SHOW_DIFF_STATS=false
+SHOW_TIME_STATS=false
 
 INPUT_RATE=""
 OUTPUT_RATE=""
@@ -290,6 +292,10 @@ while [[ $# -gt 0 ]]; do
 			;;
 		--diff-stats)
 			SHOW_DIFF_STATS=true
+			shift
+			;;
+		--time-stats)
+			SHOW_TIME_STATS=true
 			shift
 			;;
 		--help|-h)
@@ -542,6 +548,31 @@ order by c.bucket;
 "
 fi
 
+TIME_STATS_QUERY=""
+if [[ "$SHOW_TIME_STATS" == true ]]; then
+	TIME_STATS_QUERY="
+select '---TIMESTATS';
+select c.bucket || char(9) ||
+       round(avg((s.time_updated - s.time_created) / 1000.0 / 60.0), 1) || char(9) ||
+       round(sum((s.time_updated - s.time_created) / 1000.0 / 3600.0), 1) || char(9) ||
+       max((s.time_updated - s.time_created) / 1000 / 60) || char(9) ||
+       round(sum((s.time_updated - s.time_created) / 1000.0 / 3600.0) / count(distinct c.session_id), 1)
+from categorized c
+join session s on s.id = c.session_id
+group by c.bucket
+order by c.bucket;
+
+select '---HOURSTATS';
+select c.bucket || char(9) ||
+       cast(strftime('%H', s.time_created / 1000, 'unixepoch', 'localtime') as integer) || char(9) ||
+       count(distinct c.session_id)
+from categorized c
+join session s on s.id = c.session_id
+group by c.bucket, cast(strftime('%H', s.time_created / 1000, 'unixepoch', 'localtime') as integer)
+order by c.bucket, cast(strftime('%H', s.time_created / 1000, 'unixepoch', 'localtime') as integer);
+"
+fi
+
 ALL_DATA=$(sqlite3 "$DB_PATH" "
 $MATERIALIZE_SQL
 
@@ -594,6 +625,8 @@ $MODEL_QUERY
 
 $TOOLS_QUERY
 $DIFF_STATS_QUERY
+
+$TIME_STATS_QUERY
 ")
 
 ## --- Parse the combined output into sections ---
@@ -605,6 +638,8 @@ COST_DATA=""
 MODEL_DATA=""
 TOOLS_DATA=""
 DIFF_STATS_DATA=""
+TIME_STATS_DATA=""
+HOUR_STATS_DATA=""
 declare -A PROJECT_DATA_MAP
 CURRENT_SECTION=""
 
@@ -618,6 +653,8 @@ while IFS= read -r line; do
 		---MODELS) CURRENT_SECTION="models"; continue ;;
 		---TOOLS) CURRENT_SECTION="tools"; continue ;;
 		---DIFFSTATS) CURRENT_SECTION="diffstats"; continue ;;
+		---TIMESTATS) CURRENT_SECTION="timestats"; continue ;;
+		---HOURSTATS) CURRENT_SECTION="hourstats"; continue ;;
 	esac
 	case "$CURRENT_SECTION" in
 		overview)
@@ -654,6 +691,14 @@ while IFS= read -r line; do
 		diffstats)
 			[[ -n "$DIFF_STATS_DATA" ]] && DIFF_STATS_DATA+=$'\n'
 			DIFF_STATS_DATA+="$line"
+			;;
+		timestats)
+			[[ -n "$TIME_STATS_DATA" ]] && TIME_STATS_DATA+=$'\n'
+			TIME_STATS_DATA+="$line"
+			;;
+		hourstats)
+			[[ -n "$HOUR_STATS_DATA" ]] && HOUR_STATS_DATA+=$'\n'
+			HOUR_STATS_DATA+="$line"
 			;;
 	esac
 done <<< "$ALL_DATA"
@@ -838,5 +883,62 @@ if [[ -n "$DIFF_STATS_DATA" ]]; then
 			printf 'bucket\tadditions\tdeletions\tfiles\tsessions_with_changes\n'
 			cat
 		) | format_table
+	fi
+fi
+
+if [[ -n "$TIME_STATS_DATA" ]]; then
+	if [[ "$PRETTY" == true ]]; then
+		section_header "Session Duration"
+		printf '\n'
+		printf '  %-14s %12s %12s %12s\n' \
+			"${BOLD}Category${RESET}" "${BOLD}Avg (min)${RESET}" "${BOLD}Max (min)${RESET}" "${BOLD}Total (hrs)${RESET}"
+		printf '  %-14s %12s %12s %12s\n' \
+			"──────────────" "────────────" "────────────" "────────────"
+		while IFS=$'\t' read -r bucket avg_min total_hrs max_min _avg_hrs; do
+			printf '  %-14s %12s %12s %12s\n' \
+				"$bucket" "$avg_min" "$(format_number "$max_min")" "$total_hrs"
+		done <<< "$TIME_STATS_DATA"
+		printf '\n'
+
+		if [[ -n "$HOUR_STATS_DATA" ]]; then
+			section_header "Activity by Hour"
+			# Find max count for scaling bars
+			local_max=0
+			while IFS=$'\t' read -r _bucket _hour count; do
+				(( count > local_max )) && local_max=$count
+			done <<< "$HOUR_STATS_DATA"
+
+			local_last_bucket=""
+			while IFS=$'\t' read -r bucket hour count; do
+				if [[ "$bucket" != "$local_last_bucket" ]]; then
+					printf '\n  %s%s%s\n' "$BOLD" "$bucket" "$RESET"
+					local_last_bucket="$bucket"
+				fi
+				# Scale bar to max 20 chars
+				if (( local_max > 0 )); then
+					local_bar_len=$(( count * 20 / local_max ))
+				else
+					local_bar_len=0
+				fi
+				local_bar=""
+				for (( i=0; i<local_bar_len; i++ )); do local_bar+="█"; done
+				printf '  %02d:00  %s %s\n' "$hour" "$local_bar" "$count"
+			done <<< "$HOUR_STATS_DATA"
+			printf '\n'
+		fi
+	else
+		printf '\nSession duration\n'
+		printf '%s\n' "$TIME_STATS_DATA" | (
+			printf 'bucket\tavg_duration_min\ttotal_hours\tmax_duration_min\tavg_hours_per_session\n'
+			cat
+		) | format_table
+
+		if [[ -n "$HOUR_STATS_DATA" ]]; then
+			printf '\nActivity by hour\n'
+			printf '%s\n' "$HOUR_STATS_DATA" | (
+				printf 'bucket\thour\tsessions\n'
+				cat
+			) | format_table
+		fi
 	fi
 fi
