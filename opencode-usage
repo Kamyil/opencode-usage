@@ -19,6 +19,7 @@ Options:
   --cache-read-rate NUM     Cost per 1M cache read tokens
   --cache-write-rate NUM    Cost per 1M cache write tokens
   --currency SYMBOL         Currency symbol for cost output (default: $)
+  --titles                  Show top session titles per category
   --pretty                  Pretty-print output with box drawing and bars
   --help                    Show this help
 
@@ -207,6 +208,7 @@ DEFAULT_CATEGORY="other"
 declare -A CATEGORY_PREFIXES
 CATEGORY_NAMES=()
 PRETTY=false
+SHOW_TITLES=false
 
 INPUT_RATE=""
 OUTPUT_RATE=""
@@ -269,6 +271,10 @@ while [[ $# -gt 0 ]]; do
 		--currency)
 			CURRENCY=$2
 			shift 2
+			;;
+		--titles)
+			SHOW_TITLES=true
+			shift
 			;;
 		--pretty)
 			PRETTY=true
@@ -438,6 +444,37 @@ limit $TOP_N;
 "
 fi
 
+# Build top session titles queries if requested
+TITLE_QUERIES=""
+if [[ "$SHOW_TITLES" == true ]]; then
+	for bucket in "${CATEGORY_NAMES[@]}"; do
+		TITLE_QUERIES+="
+select '---TITLES:$(sql_escape "$bucket")';
+select s.title || char(9) ||
+       c.message_count || char(9) ||
+       (c.input_tokens + c.output_tokens + c.reasoning_tokens)
+from categorized c
+join session s on s.id = c.session_id
+where c.bucket = '$(sql_escape "$bucket")'
+order by (c.input_tokens + c.output_tokens + c.reasoning_tokens) desc
+limit $TOP_N;
+"
+	done
+	if [[ "$BUCKET_PRESENT" == false ]]; then
+		TITLE_QUERIES+="
+select '---TITLES:$(sql_escape "$DEFAULT_CATEGORY")';
+select s.title || char(9) ||
+       c.message_count || char(9) ||
+       (c.input_tokens + c.output_tokens + c.reasoning_tokens)
+from categorized c
+join session s on s.id = c.session_id
+where c.bucket = '$(sql_escape "$DEFAULT_CATEGORY")'
+order by (c.input_tokens + c.output_tokens + c.reasoning_tokens) desc
+limit $TOP_N;
+"
+	fi
+fi
+
 # Build cost query if rates are set
 COST_QUERY=""
 if [[ -n "$INPUT_RATE" || -n "$OUTPUT_RATE" || -n "$REASONING_RATE" || -n "$CACHE_READ_RATE" || -n "$CACHE_WRITE_RATE" ]]; then
@@ -494,6 +531,8 @@ order by bucket;
 
 $TOP_PROJECT_QUERIES
 
+$TITLE_QUERIES
+
 select '---SUMMARY';
 select bucket || char(9) ||
        round(100.0*sum(input_tokens+output_tokens+reasoning_tokens)
@@ -516,6 +555,7 @@ PCT_DATA=""
 SUMMARY_DATA=""
 COST_DATA=""
 declare -A PROJECT_DATA_MAP
+declare -A TITLE_DATA_MAP
 CURRENT_SECTION=""
 
 while IFS= read -r line; do
@@ -523,6 +563,7 @@ while IFS= read -r line; do
 		---OVERVIEW) CURRENT_SECTION="overview"; continue ;;
 		---PCT) CURRENT_SECTION="pct"; continue ;;
 		---PROJECTS:*) CURRENT_SECTION="projects:${line#---PROJECTS:}"; continue ;;
+		---TITLES:*) CURRENT_SECTION="titles:${line#---TITLES:}"; continue ;;
 		---SUMMARY) CURRENT_SECTION="summary"; continue ;;
 		---COST) CURRENT_SECTION="cost"; continue ;;
 	esac
@@ -541,6 +582,13 @@ while IFS= read -r line; do
 				PROJECT_DATA_MAP[$local_bucket]+=$'\n'
 			fi
 			PROJECT_DATA_MAP[$local_bucket]+="$line"
+			;;
+		titles:*)
+			local_bucket=${CURRENT_SECTION#titles:}
+			if [[ -n "${TITLE_DATA_MAP[$local_bucket]+x}" ]]; then
+				TITLE_DATA_MAP[$local_bucket]+=$'\n'
+			fi
+			TITLE_DATA_MAP[$local_bucket]+="$line"
 			;;
 		summary)
 			[[ -n "$SUMMARY_DATA" ]] && SUMMARY_DATA+=$'\n'
@@ -624,6 +672,43 @@ for bucket in "${BUCKETS[@]}"; do
 		fi
 	fi
 done
+
+if [[ "$SHOW_TITLES" == true ]]; then
+	if [[ "$PRETTY" == true ]]; then
+		section_header "Top Sessions by Tokens"
+	else
+		printf '\nTop sessions by tokens (no cache)\n'
+	fi
+
+	for bucket in "${BUCKETS[@]}"; do
+		TITLE_DATA="${TITLE_DATA_MAP[$bucket]-}"
+		if [[ "$PRETTY" == true ]]; then
+			printf '\n  %s%s%s\n' "$BOLD" "$bucket" "$RESET"
+			if [[ -z "$TITLE_DATA" ]]; then
+				printf '  %s(no data)%s\n' "$DIM" "$RESET"
+				continue
+			fi
+			printf '  %-50s %10s %18s\n' \
+				"${DIM}Title${RESET}" "${DIM}Messages${RESET}" "${DIM}Tokens${RESET}"
+			while IFS=$'\t' read -r title messages tokens; do
+				# Truncate long titles
+				if (( ${#title} > 48 )); then
+					title="${title:0:45}..."
+				fi
+				printf '  %-50s %10s %18s\n' \
+					"$title" "$(format_number "$messages")" "$(format_number "$tokens")"
+			done <<< "$TITLE_DATA"
+		else
+			printf '\n%s\n' "$bucket"
+			if [[ -n "$TITLE_DATA" ]]; then
+				printf '%s\n' "$TITLE_DATA" | (
+					printf 'title\tmessages\ttokens\n'
+					cat
+				) | format_table
+			fi
+		fi
+	done
+fi
 
 if [[ "$PRETTY" == true ]]; then
 	section_header "Summary"
