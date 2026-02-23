@@ -21,6 +21,7 @@ Options:
   --currency SYMBOL         Currency symbol for cost output (default: $)
   --by-model                Show token breakdown by model/provider per category
   --tools                   Show tool usage breakdown per category
+  --diff-stats              Show lines of code added/deleted per category
   --pretty                  Pretty-print output with box drawing and bars
   --help                    Show this help
 
@@ -211,6 +212,7 @@ CATEGORY_NAMES=()
 PRETTY=false
 BY_MODEL=false
 SHOW_TOOLS=false
+SHOW_DIFF_STATS=false
 
 INPUT_RATE=""
 OUTPUT_RATE=""
@@ -284,6 +286,10 @@ while [[ $# -gt 0 ]]; do
 			;;
 		--tools)
 			SHOW_TOOLS=true
+			shift
+			;;
+		--diff-stats)
+			SHOW_DIFF_STATS=true
 			shift
 			;;
 		--help|-h)
@@ -520,6 +526,22 @@ order by c.bucket, count(*) desc;
 "
 fi
 
+DIFF_STATS_QUERY=""
+if [[ "$SHOW_DIFF_STATS" == true ]]; then
+	DIFF_STATS_QUERY="
+select '---DIFFSTATS';
+select c.bucket || char(9) ||
+       coalesce(sum(s.summary_additions), 0) || char(9) ||
+       coalesce(sum(s.summary_deletions), 0) || char(9) ||
+       coalesce(sum(s.summary_files), 0) || char(9) ||
+       count(distinct case when coalesce(s.summary_additions,0) > 0 or coalesce(s.summary_deletions,0) > 0 then c.session_id end)
+from categorized c
+join session s on s.id = c.session_id
+group by c.bucket
+order by c.bucket;
+"
+fi
+
 ALL_DATA=$(sqlite3 "$DB_PATH" "
 $MATERIALIZE_SQL
 
@@ -571,6 +593,7 @@ $COST_QUERY
 $MODEL_QUERY
 
 $TOOLS_QUERY
+$DIFF_STATS_QUERY
 ")
 
 ## --- Parse the combined output into sections ---
@@ -581,6 +604,7 @@ SUMMARY_DATA=""
 COST_DATA=""
 MODEL_DATA=""
 TOOLS_DATA=""
+DIFF_STATS_DATA=""
 declare -A PROJECT_DATA_MAP
 CURRENT_SECTION=""
 
@@ -593,6 +617,7 @@ while IFS= read -r line; do
 		---COST) CURRENT_SECTION="cost"; continue ;;
 		---MODELS) CURRENT_SECTION="models"; continue ;;
 		---TOOLS) CURRENT_SECTION="tools"; continue ;;
+		---DIFFSTATS) CURRENT_SECTION="diffstats"; continue ;;
 	esac
 	case "$CURRENT_SECTION" in
 		overview)
@@ -625,6 +650,10 @@ while IFS= read -r line; do
 		tools)
 			[[ -n "$TOOLS_DATA" ]] && TOOLS_DATA+=$'\n'
 			TOOLS_DATA+="$line"
+			;;
+		diffstats)
+			[[ -n "$DIFF_STATS_DATA" ]] && DIFF_STATS_DATA+=$'\n'
+			DIFF_STATS_DATA+="$line"
 			;;
 	esac
 done <<< "$ALL_DATA"
@@ -780,6 +809,33 @@ if [[ -n "$TOOLS_DATA" ]]; then
 		printf '\nTool usage\n'
 		printf '%s\n' "$TOOLS_DATA" | (
 			printf 'bucket\ttool\tcalls\tpct\n'
+			cat
+		) | format_table
+	fi
+fi
+
+if [[ -n "$DIFF_STATS_DATA" ]]; then
+	if [[ "$PRETTY" == true ]]; then
+		section_header "Code Impact (Git Diff Stats)"
+		printf '\n'
+		printf '  %-14s %12s %12s %12s %10s\n' \
+			"${BOLD}Category${RESET}" "${BOLD}${GREEN}+Added${RESET}" "${BOLD}${YELLOW}-Deleted${RESET}" "${BOLD}Net${RESET}" "${BOLD}Files${RESET}"
+		printf '  %-14s %12s %12s %12s %10s\n' \
+			"──────────────" "────────────" "────────────" "────────────" "──────────"
+		while IFS=$'\t' read -r bucket additions deletions files sessions_with; do
+			local_net=$(( additions - deletions ))
+			printf '  %-14s %s%12s%s %s%12s%s %12s %10s\n' \
+				"$bucket" \
+				"$GREEN" "+$(format_number "$additions")" "$RESET" \
+				"$YELLOW" "-$(format_number "$deletions")" "$RESET" \
+				"$(format_number "$local_net")" \
+				"$(format_number "$files")"
+		done <<< "$DIFF_STATS_DATA"
+		printf '\n'
+	else
+		printf '\nCode impact (git diff stats)\n'
+		printf '%s\n' "$DIFF_STATS_DATA" | (
+			printf 'bucket\tadditions\tdeletions\tfiles\tsessions_with_changes\n'
 			cat
 		) | format_table
 	fi
