@@ -19,6 +19,8 @@ Options:
   --cache-read-rate NUM     Cost per 1M cache read tokens
   --cache-write-rate NUM    Cost per 1M cache write tokens
   --currency SYMBOL         Currency symbol for cost output (default: $)
+  --json                    Output report as JSON
+  --csv                     Output overview as CSV
   --pretty                  Pretty-print output with box drawing and bars
   --help                    Show this help
 
@@ -43,6 +45,26 @@ sql_escape() {
 	local value=$1
 	value=${value//\'/\'\'}
 	printf '%s' "$value"
+}
+
+json_escape() {
+	local value=$1
+	value=${value//\\/\\\\}
+	value=${value//\"/\\\"}
+	value=${value//$'\n'/\\n}
+	value=${value//$'\t'/\\t}
+	value=${value//$'\r'/\\r}
+	printf '%s' "$value"
+}
+
+csv_escape() {
+	local value=$1
+	if [[ "$value" == *[,\"$'\n']* ]]; then
+		value=${value//\"/\"\"}
+		printf '"%s"' "$value"
+	else
+		printf '%s' "$value"
+	fi
 }
 
 build_like_clause() {
@@ -207,6 +229,7 @@ DEFAULT_CATEGORY="other"
 declare -A CATEGORY_PREFIXES
 CATEGORY_NAMES=()
 PRETTY=false
+OUTPUT_FORMAT="text"
 
 INPUT_RATE=""
 OUTPUT_RATE=""
@@ -270,6 +293,14 @@ while [[ $# -gt 0 ]]; do
 			CURRENCY=$2
 			shift 2
 			;;
+		--json)
+			OUTPUT_FORMAT="json"
+			shift
+			;;
+		--csv)
+			OUTPUT_FORMAT="csv"
+			shift
+			;;
 		--pretty)
 			PRETTY=true
 			shift
@@ -287,6 +318,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 DB_PATH=$(expand_path "$DB_PATH")
+
+if [[ "$OUTPUT_FORMAT" != "text" && "$PRETTY" == true ]]; then
+	printf 'Error: --json/--csv cannot be combined with --pretty\n' >&2
+	exit 1
+fi
 
 if [[ -z "${CATEGORY_NAMES[*]-}" ]]; then
 	printf 'At least one --category NAME:PATH is required.\n' >&2
@@ -392,7 +428,7 @@ if [[ "$PRETTY" == true ]]; then
 	box_line 60 "${BOLD}${CYAN}OpenCode Usage Report${RESET}"
 	box_line 60 "${DIM}$MONTH_START to $MONTH_END${RESET}"
 	box_bottom 60
-else
+elif [[ "$OUTPUT_FORMAT" == "text" ]]; then
 	printf 'OpenCode usage for %s to %s (exclusive)\n\n' "$MONTH_START" "$MONTH_END"
 fi
 
@@ -555,6 +591,131 @@ done <<< "$ALL_DATA"
 
 ## --- Render output ---
 
+if [[ "$OUTPUT_FORMAT" == "json" ]]; then
+	# --- JSON output ---
+	printf '{\n'
+	printf '  "period": {"start": "%s", "end": "%s"},\n' "$MONTH_START" "$MONTH_END"
+
+	# Overview array
+	printf '  "overview": [\n'
+	local_first=true
+	while IFS=$'\t' read -r bucket sessions messages input output reasoning cread cwrite total total_cache; do
+		[[ "$local_first" == true ]] && local_first=false || printf ',\n'
+		printf '    {"category": "%s", "sessions": %s, "messages": %s, "input_tokens": %s, "output_tokens": %s, "reasoning_tokens": %s, "cache_read_tokens": %s, "cache_write_tokens": %s, "total_tokens": %s, "total_tokens_with_cache": %s}' \
+			"$(json_escape "$bucket")" "$sessions" "$messages" "$input" "$output" "$reasoning" "$cread" "$cwrite" "$total" "$total_cache"
+	done <<< "$OVERVIEW_DATA"
+	printf '\n  ],\n'
+
+	# Percentages array
+	printf '  "percentages": [\n'
+	local_first=true
+	while IFS=$'\t' read -r bucket pct_tokens pct_cache pct_msgs pct_sess; do
+		[[ "$local_first" == true ]] && local_first=false || printf ',\n'
+		printf '    {"category": "%s", "pct_tokens": %s, "pct_tokens_with_cache": %s, "pct_messages": %s, "pct_sessions": %s}' \
+			"$(json_escape "$bucket")" "$pct_tokens" "$pct_cache" "$pct_msgs" "$pct_sess"
+	done <<< "$PCT_DATA"
+	printf '\n  ],\n'
+
+	# Top projects per bucket
+	BUCKETS=("${CATEGORY_NAMES[@]}")
+	if [[ "$BUCKET_PRESENT" == false ]]; then
+		BUCKETS+=("$DEFAULT_CATEGORY")
+	fi
+	printf '  "top_projects": {\n'
+	local_bfirst=true
+	for bucket in "${BUCKETS[@]}"; do
+		[[ "$local_bfirst" == true ]] && local_bfirst=false || printf ',\n'
+		printf '    "%s": [\n' "$(json_escape "$bucket")"
+		PROJECT_DATA="${PROJECT_DATA_MAP[$bucket]-}"
+		if [[ -n "$PROJECT_DATA" ]]; then
+			local_first=true
+			while IFS=$'\t' read -r worktree sessions messages tokens; do
+				[[ "$local_first" == true ]] && local_first=false || printf ',\n'
+				printf '      {"worktree": "%s", "sessions": %s, "messages": %s, "tokens": %s}' \
+					"$(json_escape "$worktree")" "$sessions" "$messages" "$tokens"
+			done <<< "$PROJECT_DATA"
+			printf '\n'
+		fi
+		printf '    ]'
+	done
+	printf '\n  },\n'
+
+	# Summary array
+	printf '  "summary": [\n'
+	local_first=true
+	while IFS=$'\t' read -r bucket pct_tokens pct_msgs messages tokens; do
+		[[ "$local_first" == true ]] && local_first=false || printf ',\n'
+		printf '    {"category": "%s", "pct_tokens": %s, "pct_messages": %s, "messages": %s, "tokens": %s}' \
+			"$(json_escape "$bucket")" "$pct_tokens" "$pct_msgs" "$messages" "$tokens"
+	done <<< "$SUMMARY_DATA"
+	printf '\n  ]'
+
+	# Cost (optional)
+	if [[ -n "$COST_DATA" ]]; then
+		printf ',\n  "cost": {\n'
+		printf '    "currency": "%s",\n' "$(json_escape "$CURRENCY")"
+		printf '    "rates": {"input": %s, "output": %s, "reasoning": %s, "cache_read": %s, "cache_write": %s},\n' \
+			"${INPUT_RATE:-0}" "${OUTPUT_RATE:-0}" "${REASONING_RATE:-0}" "${CACHE_READ_RATE:-0}" "${CACHE_WRITE_RATE:-0}"
+		printf '    "by_category": [\n'
+		local_first=true
+		while IFS=$'\t' read -r bucket cost; do
+			[[ "$local_first" == true ]] && local_first=false || printf ',\n'
+			printf '      {"category": "%s", "cost": %s}' "$(json_escape "$bucket")" "$cost"
+		done <<< "$COST_DATA"
+		printf '\n    ]\n  }'
+	fi
+
+	printf '\n}\n'
+
+elif [[ "$OUTPUT_FORMAT" == "csv" ]]; then
+	# --- CSV output ---
+	printf 'category,sessions,messages,input_tokens,output_tokens,reasoning_tokens,cache_read_tokens,cache_write_tokens,total_tokens,total_tokens_with_cache\n'
+	while IFS=$'\t' read -r bucket sessions messages input output reasoning cread cwrite total total_cache; do
+		printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+			"$(csv_escape "$bucket")" "$sessions" "$messages" "$input" "$output" "$reasoning" "$cread" "$cwrite" "$total" "$total_cache"
+	done <<< "$OVERVIEW_DATA"
+
+	# Percentages
+	printf '\ncategory,pct_tokens,pct_tokens_with_cache,pct_messages,pct_sessions\n'
+	while IFS=$'\t' read -r bucket pct_tokens pct_cache pct_msgs pct_sess; do
+		printf '%s,%s,%s,%s,%s\n' \
+			"$(csv_escape "$bucket")" "$pct_tokens" "$pct_cache" "$pct_msgs" "$pct_sess"
+	done <<< "$PCT_DATA"
+
+	# Top projects per bucket
+	BUCKETS=("${CATEGORY_NAMES[@]}")
+	if [[ "$BUCKET_PRESENT" == false ]]; then
+		BUCKETS+=("$DEFAULT_CATEGORY")
+	fi
+	printf '\ncategory,worktree,sessions,messages,tokens\n'
+	for bucket in "${BUCKETS[@]}"; do
+		PROJECT_DATA="${PROJECT_DATA_MAP[$bucket]-}"
+		if [[ -n "$PROJECT_DATA" ]]; then
+			while IFS=$'\t' read -r worktree sessions messages tokens; do
+				printf '%s,%s,%s,%s,%s\n' \
+					"$(csv_escape "$bucket")" "$(csv_escape "$worktree")" "$sessions" "$messages" "$tokens"
+			done <<< "$PROJECT_DATA"
+		fi
+	done
+
+	# Summary
+	printf '\ncategory,pct_tokens,pct_messages,messages,tokens\n'
+	while IFS=$'\t' read -r bucket pct_tokens pct_msgs messages tokens; do
+		printf '%s,%s,%s,%s,%s\n' \
+			"$(csv_escape "$bucket")" "$pct_tokens" "$pct_msgs" "$messages" "$tokens"
+	done <<< "$SUMMARY_DATA"
+
+	# Cost (optional)
+	if [[ -n "$COST_DATA" ]]; then
+		printf '\ncategory,cost\n'
+		while IFS=$'\t' read -r bucket cost; do
+			printf '%s,%s\n' "$(csv_escape "$bucket")" "$cost"
+		done <<< "$COST_DATA"
+	fi
+
+else
+# --- Normal text/pretty output ---
+
 if [[ "$PRETTY" == true ]]; then
 	section_header "Overview"
 	printf '\n'
@@ -659,3 +820,5 @@ if [[ -n "$COST_DATA" ]]; then
 		) | format_table
 	fi
 fi
+
+fi # end OUTPUT_FORMAT
