@@ -1076,6 +1076,144 @@ if [[ "$OUTPUT_FORMAT" == "json" ]]; then
 		printf '\n    ]\n  }'
 	fi
 
+	# Model breakdown (optional)
+	if [[ -n "$MODEL_DATA" ]]; then
+		printf ',\n  "models": [\n'
+		local_first=true
+		while IFS=$'\t' read -r bucket model input_tok output_tok reasoning_tok total_tok sessions messages pct; do
+			[[ "$local_first" == true ]] && local_first=false || printf ',\n'
+			printf '    {"category": "%s", "model": "%s", "input_tokens": %s, "output_tokens": %s, "reasoning_tokens": %s, "total_tokens": %s, "sessions": %s, "messages": %s, "pct": %s}' \
+				"$(json_escape "$bucket")" "$(json_escape "$model")" "$input_tok" "$output_tok" "$reasoning_tok" "$total_tok" "$sessions" "$messages" "$pct"
+		done <<< "$MODEL_DATA"
+		printf '\n  ]'
+	fi
+
+	# Tool usage (optional)
+	if [[ -n "$TOOLS_DATA" ]]; then
+		printf ',\n  "tools": [\n'
+		local_first=true
+		while IFS=$'\t' read -r bucket tool_name call_count pct; do
+			[[ "$local_first" == true ]] && local_first=false || printf ',\n'
+			printf '    {"category": "%s", "tool": "%s", "calls": %s, "pct": %s}' \
+				"$(json_escape "$bucket")" "$(json_escape "$tool_name")" "$call_count" "$pct"
+		done <<< "$TOOLS_DATA"
+		printf '\n  ]'
+	fi
+
+	# Diff stats (optional)
+	if [[ -n "$DIFF_STATS_DATA" ]]; then
+		printf ',\n  "diff_stats": [\n'
+		local_first=true
+		while IFS=$'\t' read -r bucket additions deletions files sessions_with; do
+			[[ "$local_first" == true ]] && local_first=false || printf ',\n'
+			printf '    {"category": "%s", "additions": %s, "deletions": %s, "files": %s, "sessions_with_changes": %s}' \
+				"$(json_escape "$bucket")" "$additions" "$deletions" "$files" "$sessions_with"
+		done <<< "$DIFF_STATS_DATA"
+		printf '\n  ]'
+	fi
+
+	# Time stats (optional)
+	if [[ -n "$TIME_STATS_DATA" ]]; then
+		printf ',\n  "time_stats": [\n'
+		local_first=true
+		while IFS=$'\t' read -r bucket avg_min min_min max_min multi_count; do
+			[[ "$local_first" == true ]] && local_first=false || printf ',\n'
+			printf '    {"category": "%s", "avg_duration_min": %s, "min_duration_min": %s, "max_duration_min": %s, "multi_message_sessions": %s}' \
+				"$(json_escape "$bucket")" "$avg_min" "$min_min" "$max_min" "$multi_count"
+		done <<< "$TIME_STATS_DATA"
+		printf '\n  ]'
+	fi
+	if [[ -n "$HOUR_STATS_DATA" ]]; then
+		printf ',\n  "hour_stats": [\n'
+		local_first=true
+		while IFS=$'\t' read -r bucket hour sessions; do
+			[[ "$local_first" == true ]] && local_first=false || printf ',\n'
+			printf '    {"category": "%s", "hour": %s, "sessions": %s}' \
+				"$(json_escape "$bucket")" "$hour" "$sessions"
+		done <<< "$HOUR_STATS_DATA"
+		printf '\n  ]'
+	fi
+
+	# Actual cost (optional)
+	if [[ -n "$ACTUAL_COST_DATA" ]]; then
+		printf ',\n  "actual_cost": [\n'
+		local_first=true
+		while IFS=$'\t' read -r bucket actual_cost _sessions; do
+			[[ "$local_first" == true ]] && local_first=false || printf ',\n'
+			printf '    {"category": "%s", "cost": %s, "sessions": %s}' \
+				"$(json_escape "$bucket")" "$actual_cost" "$_sessions"
+		done <<< "$ACTUAL_COST_DATA"
+		printf '\n  ]'
+	fi
+
+	# Todo stats (optional)
+	if [[ -n "$TODOS_STATUS_DATA" ]]; then
+		printf ',\n  "todos_status": [\n'
+		local_first=true
+		while IFS=$'\t' read -r bucket status count; do
+			[[ "$local_first" == true ]] && local_first=false || printf ',\n'
+			printf '    {"category": "%s", "status": "%s", "count": %s}' \
+				"$(json_escape "$bucket")" "$(json_escape "$status")" "$count"
+		done <<< "$TODOS_STATUS_DATA"
+		printf '\n  ]'
+	fi
+	if [[ -n "$TODOS_PRIORITY_DATA" ]]; then
+		printf ',\n  "todos_priority": [\n'
+		local_first=true
+		while IFS=$'\t' read -r bucket priority count; do
+			[[ "$local_first" == true ]] && local_first=false || printf ',\n'
+			printf '    {"category": "%s", "priority": "%s", "count": %s}' \
+				"$(json_escape "$bucket")" "$(json_escape "$priority")" "$count"
+		done <<< "$TODOS_PRIORITY_DATA"
+		printf '\n  ]'
+	fi
+
+	# Session titles (optional)
+	if [[ -n "${TITLE_DATA_MAP[*]+x}" ]]; then
+		BUCKETS=("${CATEGORY_NAMES[@]}")
+		if [[ "$BUCKET_PRESENT" == false ]]; then
+			BUCKETS+=("$DEFAULT_CATEGORY")
+		fi
+		printf ',\n  "titles": {\n'
+		local_bfirst=true
+		for bucket in "${BUCKETS[@]}"; do
+			TITLE_DATA="${TITLE_DATA_MAP[$bucket]-}"
+			[[ -z "$TITLE_DATA" ]] && continue
+			[[ "$local_bfirst" == true ]] && local_bfirst=false || printf ',\n'
+			printf '    "%s": [\n' "$(json_escape "$bucket")"
+			local_first=true
+			while IFS=$'\t' read -r title messages tokens; do
+				[[ "$local_first" == true ]] && local_first=false || printf ',\n'
+				printf '      {"title": "%s", "messages": %s, "tokens": %s}' \
+					"$(json_escape "$title")" "$messages" "$tokens"
+			done <<< "$TITLE_DATA"
+			printf '\n    ]'
+		done
+		printf '\n  }'
+	fi
+
+	# Fork tracking (optional)
+	if [[ -n "$FORKS_SUMMARY_DATA" ]]; then
+		printf ',\n  "forks_summary": [\n'
+		local_first=true
+		while IFS=$'\t' read -r bucket fork_count sessions_with avg_forks; do
+			[[ "$local_first" == true ]] && local_first=false || printf ',\n'
+			printf '    {"category": "%s", "fork_count": %s, "sessions_with_forks": %s, "avg_forks": %s}' \
+				"$(json_escape "$bucket")" "$fork_count" "$sessions_with" "$avg_forks"
+		done <<< "$FORKS_SUMMARY_DATA"
+		printf '\n  ]'
+	fi
+	if [[ -n "$FORKS_TOP_DATA" ]]; then
+		printf ',\n  "forks_top": [\n'
+		local_first=true
+		while IFS=$'\t' read -r bucket title fork_count; do
+			[[ "$local_first" == true ]] && local_first=false || printf ',\n'
+			printf '    {"category": "%s", "title": "%s", "fork_count": %s}' \
+				"$(json_escape "$bucket")" "$(json_escape "$title")" "$fork_count"
+		done <<< "$FORKS_TOP_DATA"
+		printf '\n  ]'
+	fi
+
 	printf '\n}\n'
 
 elif [[ "$OUTPUT_FORMAT" == "csv" ]]; then
@@ -1122,6 +1260,103 @@ elif [[ "$OUTPUT_FORMAT" == "csv" ]]; then
 		while IFS=$'\t' read -r bucket cost; do
 			printf '%s,%s\n' "$(csv_escape "$bucket")" "$cost"
 		done <<< "$COST_DATA"
+	fi
+
+	# Model breakdown (optional)
+	if [[ -n "$MODEL_DATA" ]]; then
+		printf '\ncategory,model,input_tokens,output_tokens,reasoning_tokens,total_tokens,sessions,messages,pct\n'
+		while IFS=$'\t' read -r bucket model input_tok output_tok reasoning_tok total_tok sessions messages pct; do
+			printf '%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+				"$(csv_escape "$bucket")" "$(csv_escape "$model")" "$input_tok" "$output_tok" "$reasoning_tok" "$total_tok" "$sessions" "$messages" "$pct"
+		done <<< "$MODEL_DATA"
+	fi
+
+	# Tool usage (optional)
+	if [[ -n "$TOOLS_DATA" ]]; then
+		printf '\ncategory,tool,calls,pct\n'
+		while IFS=$'\t' read -r bucket tool_name call_count pct; do
+			printf '%s,%s,%s,%s\n' \
+				"$(csv_escape "$bucket")" "$(csv_escape "$tool_name")" "$call_count" "$pct"
+		done <<< "$TOOLS_DATA"
+	fi
+
+	# Diff stats (optional)
+	if [[ -n "$DIFF_STATS_DATA" ]]; then
+		printf '\ncategory,additions,deletions,files,sessions_with_changes\n'
+		while IFS=$'\t' read -r bucket additions deletions files sessions_with; do
+			printf '%s,%s,%s,%s,%s\n' \
+				"$(csv_escape "$bucket")" "$additions" "$deletions" "$files" "$sessions_with"
+		done <<< "$DIFF_STATS_DATA"
+	fi
+
+	# Time stats (optional)
+	if [[ -n "$TIME_STATS_DATA" ]]; then
+		printf '\ncategory,avg_duration_min,min_duration_min,max_duration_min,multi_message_sessions\n'
+		while IFS=$'\t' read -r bucket avg_min min_min max_min multi_count; do
+			printf '%s,%s,%s,%s,%s\n' \
+				"$(csv_escape "$bucket")" "$avg_min" "$min_min" "$max_min" "$multi_count"
+		done <<< "$TIME_STATS_DATA"
+	fi
+	if [[ -n "$HOUR_STATS_DATA" ]]; then
+		printf '\ncategory,hour,sessions\n'
+		while IFS=$'\t' read -r bucket hour sessions; do
+			printf '%s,%s,%s\n' \
+				"$(csv_escape "$bucket")" "$hour" "$sessions"
+		done <<< "$HOUR_STATS_DATA"
+	fi
+
+	# Actual cost (optional)
+	if [[ -n "$ACTUAL_COST_DATA" ]]; then
+		printf '\ncategory,actual_cost,sessions\n'
+		while IFS=$'\t' read -r bucket actual_cost sessions; do
+			printf '%s,%s,%s\n' "$(csv_escape "$bucket")" "$actual_cost" "$sessions"
+		done <<< "$ACTUAL_COST_DATA"
+	fi
+
+	# Todo stats (optional)
+	if [[ -n "$TODOS_STATUS_DATA" ]]; then
+		printf '\ncategory,status,count\n'
+		while IFS=$'\t' read -r bucket status count; do
+			printf '%s,%s,%s\n' "$(csv_escape "$bucket")" "$(csv_escape "$status")" "$count"
+		done <<< "$TODOS_STATUS_DATA"
+	fi
+	if [[ -n "$TODOS_PRIORITY_DATA" ]]; then
+		printf '\ncategory,priority,count\n'
+		while IFS=$'\t' read -r bucket priority count; do
+			printf '%s,%s,%s\n' "$(csv_escape "$bucket")" "$(csv_escape "$priority")" "$count"
+		done <<< "$TODOS_PRIORITY_DATA"
+	fi
+
+	# Session titles (optional)
+	if [[ -n "${TITLE_DATA_MAP[*]+x}" ]]; then
+		BUCKETS=("${CATEGORY_NAMES[@]}")
+		if [[ "$BUCKET_PRESENT" == false ]]; then
+			BUCKETS+=("$DEFAULT_CATEGORY")
+		fi
+		printf '\ncategory,title,messages,tokens\n'
+		for bucket in "${BUCKETS[@]}"; do
+			TITLE_DATA="${TITLE_DATA_MAP[$bucket]-}"
+			if [[ -n "$TITLE_DATA" ]]; then
+				while IFS=$'\t' read -r title messages tokens; do
+					printf '%s,%s,%s,%s\n' \
+						"$(csv_escape "$bucket")" "$(csv_escape "$title")" "$messages" "$tokens"
+				done <<< "$TITLE_DATA"
+			fi
+		done
+	fi
+
+	# Fork tracking (optional)
+	if [[ -n "$FORKS_SUMMARY_DATA" ]]; then
+		printf '\ncategory,fork_count,sessions_with_forks,avg_forks\n'
+		while IFS=$'\t' read -r bucket fork_count sessions_with avg_forks; do
+			printf '%s,%s,%s,%s\n' "$(csv_escape "$bucket")" "$fork_count" "$sessions_with" "$avg_forks"
+		done <<< "$FORKS_SUMMARY_DATA"
+	fi
+	if [[ -n "$FORKS_TOP_DATA" ]]; then
+		printf '\ncategory,title,fork_count\n'
+		while IFS=$'\t' read -r bucket title fork_count; do
+			printf '%s,%s,%s\n' "$(csv_escape "$bucket")" "$(csv_escape "$title")" "$fork_count"
+		done <<< "$FORKS_TOP_DATA"
 	fi
 
 else
