@@ -19,6 +19,7 @@ Options:
   --cache-read-rate NUM     Cost per 1M cache read tokens
   --cache-write-rate NUM    Cost per 1M cache write tokens
   --currency SYMBOL         Currency symbol for cost output (default: $)
+  --cost                    Show actual cost from provider (if reported)
   --pretty                  Pretty-print output with box drawing and bars
   --help                    Show this help
 
@@ -207,6 +208,7 @@ DEFAULT_CATEGORY="other"
 declare -A CATEGORY_PREFIXES
 CATEGORY_NAMES=()
 PRETTY=false
+SHOW_COST=false
 
 INPUT_RATE=""
 OUTPUT_RATE=""
@@ -269,6 +271,10 @@ while [[ $# -gt 0 ]]; do
 		--currency)
 			CURRENCY=$2
 			shift 2
+			;;
+		--cost)
+			SHOW_COST=true
+			shift
 			;;
 		--pretty)
 			PRETTY=true
@@ -460,6 +466,26 @@ order by bucket;
 "
 fi
 
+# Build actual cost query if requested
+ACTUAL_COST_QUERY=""
+if [[ "$SHOW_COST" == true ]]; then
+	ACTUAL_COST_QUERY="
+select '---ACTUAL_COST';
+select bucket || char(9) ||
+       round(sum(actual_cost), 6) || char(9) ||
+       count(distinct session_id)
+from (
+	select c.bucket, c.session_id,
+	       coalesce(json_extract(p.data,'\$.cost'), 0) as actual_cost
+	from categorized c
+	join part p on p.session_id = c.session_id
+	where json_extract(p.data,'\$.type')='step-finish'
+)
+group by bucket
+order by bucket;
+"
+fi
+
 ALL_DATA=$(sqlite3 "$DB_PATH" "
 $MATERIALIZE_SQL
 
@@ -507,6 +533,8 @@ group by bucket
 order by sum(input_tokens+output_tokens+reasoning_tokens) desc;
 
 $COST_QUERY
+
+$ACTUAL_COST_QUERY
 ")
 
 ## --- Parse the combined output into sections ---
@@ -515,6 +543,7 @@ OVERVIEW_DATA=""
 PCT_DATA=""
 SUMMARY_DATA=""
 COST_DATA=""
+ACTUAL_COST_DATA=""
 declare -A PROJECT_DATA_MAP
 CURRENT_SECTION=""
 
@@ -525,6 +554,7 @@ while IFS= read -r line; do
 		---PROJECTS:*) CURRENT_SECTION="projects:${line#---PROJECTS:}"; continue ;;
 		---SUMMARY) CURRENT_SECTION="summary"; continue ;;
 		---COST) CURRENT_SECTION="cost"; continue ;;
+		---ACTUAL_COST) CURRENT_SECTION="actual_cost"; continue ;;
 	esac
 	case "$CURRENT_SECTION" in
 		overview)
@@ -549,6 +579,10 @@ while IFS= read -r line; do
 		cost)
 			[[ -n "$COST_DATA" ]] && COST_DATA+=$'\n'
 			COST_DATA+="$line"
+			;;
+		actual_cost)
+			[[ -n "$ACTUAL_COST_DATA" ]] && ACTUAL_COST_DATA+=$'\n'
+			ACTUAL_COST_DATA+="$line"
 			;;
 	esac
 done <<< "$ALL_DATA"
@@ -657,5 +691,44 @@ if [[ -n "$COST_DATA" ]]; then
 			printf 'bucket\tcost\n'
 			cat
 		) | format_table
+	fi
+fi
+
+if [[ -n "$ACTUAL_COST_DATA" ]]; then
+	# Check if all costs are zero
+	all_zero=true
+	while IFS=$'\t' read -r bucket cost sessions; do
+		if [[ "$cost" != "0" && "$cost" != "0.0" && "$cost" != "0.000000" ]]; then
+			all_zero=false
+			break
+		fi
+	done <<< "$ACTUAL_COST_DATA"
+
+	if [[ "$PRETTY" == true ]]; then
+		section_header "Actual Cost (Provider-Reported)"
+		printf '\n'
+		if [[ "$all_zero" == true ]]; then
+			printf '  %s(no cost data — your provider does not report costs)%s\n' "$DIM" "$RESET"
+		else
+			printf '  %-14s %14s %10s\n' \
+				"${BOLD}Category${RESET}" "${BOLD}Cost${RESET}" "${BOLD}Sessions${RESET}"
+			printf '  %-14s %14s %10s\n' \
+				"──────────────" "──────────────" "──────────"
+			while IFS=$'\t' read -r bucket cost sessions; do
+				printf '  %-14s %13s%s %10s\n' \
+					"$bucket" "$CURRENCY" "$cost" "$(format_number "$sessions")"
+			done <<< "$ACTUAL_COST_DATA"
+		fi
+		printf '\n'
+	else
+		printf '\nActual cost (provider-reported)\n'
+		if [[ "$all_zero" == true ]]; then
+			printf '(no cost data — your provider does not report costs)\n'
+		else
+			printf '%s\n' "$ACTUAL_COST_DATA" | (
+				printf 'bucket\tcost\tsessions\n'
+				cat
+			) | format_table
+		fi
 	fi
 fi
