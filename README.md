@@ -14,15 +14,15 @@ Useful for splitting subscription costs between work and personal use, tracking 
 
 ```bash
 # clone and symlink
-git clone https://github.com/YOUR_USERNAME/opencode-usage.git
+git clone https://github.com/Kamyil/opencode-usage.git
 ln -s "$(pwd)/opencode-usage/opencode-usage" ~/.local/bin/opencode-usage
 
 # or just download
-curl -o ~/.local/bin/opencode-usage https://raw.githubusercontent.com/YOUR_USERNAME/opencode-usage/main/opencode-usage
+curl -o ~/.local/bin/opencode-usage https://raw.githubusercontent.com/Kamyil/opencode-usage/main/opencode-usage
 chmod +x ~/.local/bin/opencode-usage
 
 # or run directly without installing
-bash <(curl -s https://raw.githubusercontent.com/YOUR_USERNAME/opencode-usage/main/opencode-usage) \
+bash <(curl -s https://raw.githubusercontent.com/Kamyil/opencode-usage/main/opencode-usage) \
   --category work:~/Work --category personal:~/Personal
 ```
 
