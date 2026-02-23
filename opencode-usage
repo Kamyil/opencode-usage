@@ -27,6 +27,7 @@ Options:
   --cost                    Show actual cost from provider (if reported)
   --todos                   Show todo/task completion statistics
   --titles                  Show top session titles per category
+  --forks                   Show forked session statistics
   --pretty                  Pretty-print output with box drawing and bars
   --help                    Show this help
 
@@ -223,6 +224,7 @@ SHOW_MONTHS=""
 SHOW_COST=false
 SHOW_TODOS=false
 SHOW_TITLES=false
+SHOW_FORKS=false
 
 INPUT_RATE=""
 OUTPUT_RATE=""
@@ -300,6 +302,10 @@ while [[ $# -gt 0 ]]; do
 			;;
 		--titles)
 			SHOW_TITLES=true
+			shift
+			;;
+		--forks)
+			SHOW_FORKS=true
 			shift
 			;;
 		--pretty)
@@ -522,6 +528,38 @@ order by (c.input_tokens + c.output_tokens + c.reasoning_tokens) desc
 limit $TOP_N;
 "
 	fi
+fi
+
+# Build fork stats query if requested
+FORK_QUERY=""
+if [[ "$SHOW_FORKS" == true ]]; then
+	FORK_QUERY="
+select '---FORKS_SUMMARY';
+select c.bucket || char(9) ||
+       count(*) || char(9) ||
+       count(distinct s.parent_id) || char(9) ||
+       round(1.0 * count(*) / count(distinct s.parent_id), 1)
+from categorized c
+join session s on s.id = c.session_id
+where s.parent_id is not null
+group by c.bucket
+order by c.bucket;
+
+select '---FORKS_TOP';
+select bucket || char(9) || title || char(9) || fork_count
+from (
+	select c.bucket,
+	       parent_s.title,
+	       count(*) as fork_count,
+	       row_number() over (partition by c.bucket order by count(*) desc) as rn
+	from categorized c
+	join session s on s.id = c.session_id
+	join session parent_s on parent_s.id = s.parent_id
+	where s.parent_id is not null
+	group by c.bucket, s.parent_id
+)
+where rn <= $TOP_N;
+"
 fi
 
 # Build cost query if rates are set
@@ -803,6 +841,8 @@ $MONTHS_QUERY
 $ACTUAL_COST_QUERY
 
 $TODO_QUERY
+
+$FORK_QUERY
 ")
 
 ## --- Parse the combined output into sections ---
@@ -820,6 +860,8 @@ MONTHS_DATA=""
 ACTUAL_COST_DATA=""
 TODOS_STATUS_DATA=""
 TODOS_PRIORITY_DATA=""
+FORKS_SUMMARY_DATA=""
+FORKS_TOP_DATA=""
 declare -A PROJECT_DATA_MAP
 declare -A TITLE_DATA_MAP
 CURRENT_SECTION=""
@@ -841,6 +883,8 @@ while IFS= read -r line; do
 		---ACTUAL_COST) CURRENT_SECTION="actual_cost"; continue ;;
 		---TODOS_STATUS) CURRENT_SECTION="todos_status"; continue ;;
 		---TODOS_PRIORITY) CURRENT_SECTION="todos_priority"; continue ;;
+		---FORKS_SUMMARY) CURRENT_SECTION="forks_summary"; continue ;;
+		---FORKS_TOP) CURRENT_SECTION="forks_top"; continue ;;
 	esac
 	case "$CURRENT_SECTION" in
 		overview)
@@ -908,6 +952,14 @@ while IFS= read -r line; do
 		todos_priority)
 			[[ -n "$TODOS_PRIORITY_DATA" ]] && TODOS_PRIORITY_DATA+=$'\n'
 			TODOS_PRIORITY_DATA+="$line"
+			;;
+		forks_summary)
+			[[ -n "$FORKS_SUMMARY_DATA" ]] && FORKS_SUMMARY_DATA+=$'\n'
+			FORKS_SUMMARY_DATA+="$line"
+			;;
+		forks_top)
+			[[ -n "$FORKS_TOP_DATA" ]] && FORKS_TOP_DATA+=$'\n'
+			FORKS_TOP_DATA+="$line"
 			;;
 	esac
 done <<< "$ALL_DATA"
@@ -1444,5 +1496,49 @@ if [[ -n "$TODOS_PRIORITY_DATA" ]]; then
 			printf 'bucket\tpriority\tcount\n'
 			cat
 		) | format_table
+	fi
+fi
+
+if [[ -n "$FORKS_SUMMARY_DATA" ]]; then
+	if [[ "$PRETTY" == true ]]; then
+		section_header "Forked Sessions"
+		printf '\n'
+		printf '  %-14s %10s %10s %10s\n' \
+			"${BOLD}Category${RESET}" "${BOLD}Forks${RESET}" "${BOLD}Parents${RESET}" "${BOLD}Avg/Parent${RESET}"
+		printf '  %-14s %10s %10s %10s\n' \
+			"──────────────" "──────────" "──────────" "──────────"
+		while IFS=$'\t' read -r bucket forks parents avg; do
+			printf '  %-14s %10s %10s %10s\n' \
+				"$bucket" "$(format_number "$forks")" "$(format_number "$parents")" "$avg"
+		done <<< "$FORKS_SUMMARY_DATA"
+
+		if [[ -n "$FORKS_TOP_DATA" ]]; then
+			printf '\n  %sMost-forked sessions:%s\n' "$DIM" "$RESET"
+			local_prev_bucket=""
+			while IFS=$'\t' read -r bucket title fork_count; do
+				if [[ "$bucket" != "$local_prev_bucket" ]]; then
+					printf '\n  %s%s%s\n' "$BOLD" "$bucket" "$RESET"
+					local_prev_bucket=$bucket
+				fi
+				if (( ${#title} > 48 )); then
+					title="${title:0:45}..."
+				fi
+				printf '    %-50s %s forks\n' "$title" "$fork_count"
+			done <<< "$FORKS_TOP_DATA"
+		fi
+		printf '\n'
+	else
+		printf '\nForked sessions\n'
+		printf '%s\n' "$FORKS_SUMMARY_DATA" | (
+			printf 'bucket\tforks\tparent_sessions\tavg_forks_per_parent\n'
+			cat
+		) | format_table
+		if [[ -n "$FORKS_TOP_DATA" ]]; then
+			printf '\nMost-forked sessions\n'
+			printf '%s\n' "$FORKS_TOP_DATA" | (
+				printf 'bucket\ttitle\tfork_count\n'
+				cat
+			) | format_table
+		fi
 	fi
 fi
