@@ -25,6 +25,7 @@ Options:
   --time-stats              Show session duration and time-of-day analysis
   --months N                Show trends for the last N months
   --cost                    Show actual cost from provider (if reported)
+  --todos                   Show todo/task completion statistics
   --pretty                  Pretty-print output with box drawing and bars
   --help                    Show this help
 
@@ -219,6 +220,7 @@ SHOW_DIFF_STATS=false
 SHOW_TIME_STATS=false
 SHOW_MONTHS=""
 SHOW_COST=false
+SHOW_TODOS=false
 
 INPUT_RATE=""
 OUTPUT_RATE=""
@@ -288,6 +290,10 @@ while [[ $# -gt 0 ]]; do
 			;;
 		--cost)
 			SHOW_COST=true
+			shift
+			;;
+		--todos)
+			SHOW_TODOS=true
 			shift
 			;;
 		--pretty)
@@ -667,6 +673,37 @@ order by bucket;
 "
 fi
 
+# Build todo stats query if requested
+TODO_QUERY=""
+if [[ "$SHOW_TODOS" == true ]]; then
+	TODO_QUERY="
+select '---TODOS_STATUS';
+select c.bucket || char(9) ||
+       t.status || char(9) ||
+       count(*)
+from categorized c
+join todo t on t.session_id = c.session_id
+group by c.bucket, t.status
+order by c.bucket, t.status;
+
+select '---TODOS_PRIORITY';
+select c.bucket || char(9) ||
+       t.priority || char(9) ||
+       count(*)
+from categorized c
+join todo t on t.session_id = c.session_id
+group by c.bucket, t.priority
+order by c.bucket,
+  case t.priority
+    when 'critical' then 1
+    when 'high' then 2
+    when 'medium' then 3
+    when 'low' then 4
+    else 5
+  end;
+"
+fi
+
 ALL_DATA=$(sqlite3 "$DB_PATH" "
 $MATERIALIZE_SQL
 
@@ -725,6 +762,8 @@ $TIME_STATS_QUERY
 $MONTHS_QUERY
 
 $ACTUAL_COST_QUERY
+
+$TODO_QUERY
 ")
 
 ## --- Parse the combined output into sections ---
@@ -740,6 +779,8 @@ TIME_STATS_DATA=""
 HOUR_STATS_DATA=""
 MONTHS_DATA=""
 ACTUAL_COST_DATA=""
+TODOS_STATUS_DATA=""
+TODOS_PRIORITY_DATA=""
 declare -A PROJECT_DATA_MAP
 CURRENT_SECTION=""
 
@@ -757,6 +798,8 @@ while IFS= read -r line; do
 		---HOURSTATS) CURRENT_SECTION="hourstats"; continue ;;
 		---MONTHS) CURRENT_SECTION="months"; continue ;;
 		---ACTUAL_COST) CURRENT_SECTION="actual_cost"; continue ;;
+		---TODOS_STATUS) CURRENT_SECTION="todos_status"; continue ;;
+		---TODOS_PRIORITY) CURRENT_SECTION="todos_priority"; continue ;;
 	esac
 	case "$CURRENT_SECTION" in
 		overview)
@@ -809,6 +852,14 @@ while IFS= read -r line; do
 		actual_cost)
 			[[ -n "$ACTUAL_COST_DATA" ]] && ACTUAL_COST_DATA+=$'\n'
 			ACTUAL_COST_DATA+="$line"
+			;;
+		todos_status)
+			[[ -n "$TODOS_STATUS_DATA" ]] && TODOS_STATUS_DATA+=$'\n'
+			TODOS_STATUS_DATA+="$line"
+			;;
+		todos_priority)
+			[[ -n "$TODOS_PRIORITY_DATA" ]] && TODOS_PRIORITY_DATA+=$'\n'
+			TODOS_PRIORITY_DATA+="$line"
 			;;
 	esac
 done <<< "$ALL_DATA"
@@ -1197,5 +1248,116 @@ if [[ -n "$ACTUAL_COST_DATA" ]]; then
 				cat
 			) | format_table
 		fi
+	fi
+fi
+
+if [[ -n "$TODOS_STATUS_DATA" ]]; then
+	# Build a map: bucket -> {status: count, ...}
+	declare -A TODO_STATUS_MAP
+	ALL_STATUSES=()
+	declare -A STATUS_SEEN
+
+	while IFS=$'\t' read -r bucket status count; do
+		TODO_STATUS_MAP["$bucket|$status"]=$count
+		if [[ -z "${STATUS_SEEN[$status]+x}" ]]; then
+			STATUS_SEEN[$status]=1
+			ALL_STATUSES+=("$status")
+		fi
+	done <<< "$TODOS_STATUS_DATA"
+
+	if [[ "$PRETTY" == true ]]; then
+		section_header "Todo Status by Category"
+		printf '\n'
+		# Header
+		local_fmt="  %-14s"
+		printf "$local_fmt" "${BOLD}Category${RESET}"
+		for s in "${ALL_STATUSES[@]}"; do
+			printf ' %12s' "${BOLD}${s}${RESET}"
+		done
+		printf ' %12s\n' "${BOLD}total${RESET}"
+		printf "$local_fmt" "──────────────"
+		for s in "${ALL_STATUSES[@]}"; do
+			printf ' %12s' "────────────"
+		done
+		printf ' %12s\n' "────────────"
+
+		for bucket in "${BUCKETS[@]}"; do
+			printf "$local_fmt" "$bucket"
+			local_total=0
+			for s in "${ALL_STATUSES[@]}"; do
+				local_val=${TODO_STATUS_MAP["$bucket|$s"]:-0}
+				printf ' %12s' "$(format_number "$local_val")"
+				(( local_total += local_val ))
+			done
+			printf ' %12s\n' "$(format_number "$local_total")"
+		done
+
+		# Completion rate
+		printf '\n'
+		for bucket in "${BUCKETS[@]}"; do
+			local_completed=${TODO_STATUS_MAP["$bucket|completed"]:-0}
+			local_total=0
+			for s in "${ALL_STATUSES[@]}"; do
+				(( local_total += ${TODO_STATUS_MAP["$bucket|$s"]:-0} ))
+			done
+			if (( local_total > 0 )); then
+				local_pct=$(( local_completed * 100 / local_total ))
+				printf '  %-14s completion: %s %d%%\n' "$bucket" "$(make_bar "$local_pct")" "$local_pct"
+			fi
+		done
+		printf '\n'
+	else
+		printf '\nTodo status by category\n'
+		printf '%s\n' "$TODOS_STATUS_DATA" | (
+			printf 'bucket\tstatus\tcount\n'
+			cat
+		) | format_table
+	fi
+fi
+
+if [[ -n "$TODOS_PRIORITY_DATA" ]]; then
+	if [[ "$PRETTY" == true ]]; then
+		section_header "Todo Priority by Category"
+		printf '\n'
+
+		declare -A TODO_PRIORITY_MAP
+		ALL_PRIORITIES=()
+		declare -A PRIORITY_SEEN
+
+		while IFS=$'\t' read -r bucket priority count; do
+			TODO_PRIORITY_MAP["$bucket|$priority"]=$count
+			if [[ -z "${PRIORITY_SEEN[$priority]+x}" ]]; then
+				PRIORITY_SEEN[$priority]=1
+				ALL_PRIORITIES+=("$priority")
+			fi
+		done <<< "$TODOS_PRIORITY_DATA"
+
+		local_fmt="  %-14s"
+		printf "$local_fmt" "${BOLD}Category${RESET}"
+		for p in "${ALL_PRIORITIES[@]}"; do
+			printf ' %10s' "${BOLD}${p}${RESET}"
+		done
+		printf '\n'
+		printf "$local_fmt" "──────────────"
+		for p in "${ALL_PRIORITIES[@]}"; do
+			printf ' %10s' "──────────"
+		done
+		printf '\n'
+
+		for bucket in "${BUCKETS[@]}"; do
+			printf "$local_fmt" "$bucket"
+			for p in "${ALL_PRIORITIES[@]}"; do
+				local_val=${TODO_PRIORITY_MAP["$bucket|$p"]:-0}
+				printf ' %10s' "$(format_number "$local_val")"
+			done
+			printf '\n'
+		done
+		printf '\n'
+	else
+		printf '\nTodo priority by category\n'
+		printf '%s\n' "$TODOS_PRIORITY_DATA" | (
+			printf 'bucket\tpriority\tcount\n'
+			cat
+		) | format_table
 	fi
 fi
