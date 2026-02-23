@@ -19,6 +19,7 @@ Options:
   --cache-read-rate NUM     Cost per 1M cache read tokens
   --cache-write-rate NUM    Cost per 1M cache write tokens
   --currency SYMBOL         Currency symbol for cost output (default: $)
+  --months N                Show trends for the last N months
   --pretty                  Pretty-print output with box drawing and bars
   --help                    Show this help
 
@@ -207,6 +208,7 @@ DEFAULT_CATEGORY="other"
 declare -A CATEGORY_PREFIXES
 CATEGORY_NAMES=()
 PRETTY=false
+SHOW_MONTHS=""
 
 INPUT_RATE=""
 OUTPUT_RATE=""
@@ -270,6 +272,10 @@ while [[ $# -gt 0 ]]; do
 			CURRENCY=$2
 			shift 2
 			;;
+		--months)
+			SHOW_MONTHS=$2
+			shift 2
+			;;
 		--pretty)
 			PRETTY=true
 			shift
@@ -304,6 +310,13 @@ if [[ -n "$MONTH" ]]; then
 else
 	MONTH_START=$(sqlite3 "$DB_PATH" "select date('now','start of month');")
 	MONTH_END=$(sqlite3 "$DB_PATH" "select date('now','start of month','+1 month');")
+fi
+
+if [[ -n "$SHOW_MONTHS" ]]; then
+	if ! [[ "$SHOW_MONTHS" =~ ^[0-9]+$ ]] || (( SHOW_MONTHS < 1 )); then
+		printf 'Invalid --months value. Must be a positive integer.\n' >&2
+		exit 1
+	fi
 fi
 
 CATEGORY_WHENS=""
@@ -439,6 +452,61 @@ limit $TOP_N;
 fi
 
 # Build cost query if rates are set
+# Build multi-month trends query if requested
+MONTHS_QUERY=""
+if [[ -n "$SHOW_MONTHS" ]]; then
+	MONTHS_QUERY="
+select '---MONTHS';
+with month_range as (
+	select strftime('%Y-%m', date('$MONTH_END', '-' || n || ' months')) as month_label,
+	       strftime('%s', date('$MONTH_END', '-' || n || ' months')) * 1000 as ms_start,
+	       strftime('%s', date('$MONTH_END', '-' || (n-1) || ' months')) * 1000 as ms_end
+	from (
+		select row_number() over () as n from message limit $SHOW_MONTHS
+	)
+),
+session_first_msg as (
+	select m.session_id, min(m.time_created) as first_msg_ts
+	from message m
+	group by m.session_id
+),
+session_month as (
+	select sfm.session_id, mr.month_label
+	from session_first_msg sfm
+	join month_range mr on sfm.first_msg_ts >= mr.ms_start and sfm.first_msg_ts < mr.ms_end
+),
+session_tokens as (
+	select pt.session_id,
+	       sum(coalesce(json_extract(pt.data,'\$.tokens.input'),0)
+	         + coalesce(json_extract(pt.data,'\$.tokens.output'),0)
+	         + coalesce(json_extract(pt.data,'\$.tokens.reasoning'),0)) as tokens
+	from part pt
+	where json_extract(pt.data,'\$.type')='step-finish'
+	group by pt.session_id
+),
+month_categorized as (
+	select sm.month_label,
+	       case
+	           $CATEGORY_WHENS
+	           else '$(sql_escape "$DEFAULT_CATEGORY")'
+	       end as bucket,
+	       sm.session_id,
+	       coalesce(st.tokens, 0) as tokens
+	from session_month sm
+	join session s on s.id = sm.session_id
+	join project p on p.id = s.project_id
+	left join session_tokens st on st.session_id = sm.session_id
+)
+select month_label || char(9) ||
+       bucket || char(9) ||
+       count(distinct session_id) || char(9) ||
+       sum(tokens)
+from month_categorized
+group by month_label, bucket
+order by month_label, bucket;
+"
+fi
+
 COST_QUERY=""
 if [[ -n "$INPUT_RATE" || -n "$OUTPUT_RATE" || -n "$REASONING_RATE" || -n "$CACHE_READ_RATE" || -n "$CACHE_WRITE_RATE" ]]; then
 	INPUT_RATE=${INPUT_RATE:-0}
@@ -507,6 +575,8 @@ group by bucket
 order by sum(input_tokens+output_tokens+reasoning_tokens) desc;
 
 $COST_QUERY
+
+$MONTHS_QUERY
 ")
 
 ## --- Parse the combined output into sections ---
@@ -515,6 +585,7 @@ OVERVIEW_DATA=""
 PCT_DATA=""
 SUMMARY_DATA=""
 COST_DATA=""
+MONTHS_DATA=""
 declare -A PROJECT_DATA_MAP
 CURRENT_SECTION=""
 
@@ -525,6 +596,7 @@ while IFS= read -r line; do
 		---PROJECTS:*) CURRENT_SECTION="projects:${line#---PROJECTS:}"; continue ;;
 		---SUMMARY) CURRENT_SECTION="summary"; continue ;;
 		---COST) CURRENT_SECTION="cost"; continue ;;
+		---MONTHS) CURRENT_SECTION="months"; continue ;;
 	esac
 	case "$CURRENT_SECTION" in
 		overview)
@@ -549,6 +621,10 @@ while IFS= read -r line; do
 		cost)
 			[[ -n "$COST_DATA" ]] && COST_DATA+=$'\n'
 			COST_DATA+="$line"
+			;;
+		months)
+			[[ -n "$MONTHS_DATA" ]] && MONTHS_DATA+=$'\n'
+			MONTHS_DATA+="$line"
 			;;
 	esac
 done <<< "$ALL_DATA"
@@ -657,5 +733,113 @@ if [[ -n "$COST_DATA" ]]; then
 			printf 'bucket\tcost\n'
 			cat
 		) | format_table
+	fi
+fi
+
+if [[ -n "$MONTHS_DATA" ]]; then
+	# Collect all months and buckets from the data
+	declare -A MONTHS_MAP  # key="month|bucket" -> "sessions\ttokens"
+	MONTH_LIST=()
+	declare -A MONTH_SEEN
+	declare -A BUCKET_SEEN_MONTHS
+	BUCKET_LIST_MONTHS=()
+
+	while IFS=$'\t' read -r month bucket sessions tokens; do
+		MONTHS_MAP["$month|$bucket"]="${sessions}	${tokens}"
+		if [[ -z "${MONTH_SEEN[$month]+x}" ]]; then
+			MONTH_SEEN[$month]=1
+			MONTH_LIST+=("$month")
+		fi
+		if [[ -z "${BUCKET_SEEN_MONTHS[$bucket]+x}" ]]; then
+			BUCKET_SEEN_MONTHS[$bucket]=1
+			BUCKET_LIST_MONTHS+=("$bucket")
+		fi
+	done <<< "$MONTHS_DATA"
+
+	if [[ "$PRETTY" == true ]]; then
+		section_header "Multi-Month Trends (Sessions)"
+		printf '\n'
+		# Header: Month + one column per bucket
+		local_fmt="  %-10s"
+		printf "$local_fmt" "${BOLD}Month${RESET}"
+		for b in "${BUCKET_LIST_MONTHS[@]}"; do
+			printf ' %10s' "${BOLD}${b}${RESET}"
+		done
+		printf '\n'
+		printf "$local_fmt" "──────────"
+		for b in "${BUCKET_LIST_MONTHS[@]}"; do
+			printf ' %10s' "──────────"
+		done
+		printf '\n'
+		for m in "${MONTH_LIST[@]}"; do
+			printf "$local_fmt" "$m"
+			for b in "${BUCKET_LIST_MONTHS[@]}"; do
+				local_val="${MONTHS_MAP["$m|$b"]:-0	0}"
+				IFS=$'\t' read -r s _t <<< "$local_val"
+				printf ' %10s' "$(format_number "$s")"
+			done
+			printf '\n'
+		done
+
+		section_header "Multi-Month Trends (Tokens)"
+		printf '\n'
+		printf "$local_fmt" "${BOLD}Month${RESET}"
+		for b in "${BUCKET_LIST_MONTHS[@]}"; do
+			printf ' %18s' "${BOLD}${b}${RESET}"
+		done
+		printf '\n'
+		printf "$local_fmt" "──────────"
+		for b in "${BUCKET_LIST_MONTHS[@]}"; do
+			printf ' %18s' "──────────────────"
+		done
+		printf '\n'
+		# Find max tokens for bar scaling
+		local_max_tokens=0
+		for m in "${MONTH_LIST[@]}"; do
+			for b in "${BUCKET_LIST_MONTHS[@]}"; do
+				local_val="${MONTHS_MAP["$m|$b"]:-0	0}"
+				IFS=$'\t' read -r _s t <<< "$local_val"
+				(( t > local_max_tokens )) && local_max_tokens=$t
+			done
+		done
+		for m in "${MONTH_LIST[@]}"; do
+			printf "$local_fmt" "$m"
+			for b in "${BUCKET_LIST_MONTHS[@]}"; do
+				local_val="${MONTHS_MAP["$m|$b"]:-0	0}"
+				IFS=$'\t' read -r _s t <<< "$local_val"
+				printf ' %18s' "$(format_number "$t")"
+			done
+			printf '\n'
+		done
+		printf '\n'
+
+		# Bar chart: tokens per month stacked
+		section_header "Monthly Token Distribution"
+		printf '\n'
+		for m in "${MONTH_LIST[@]}"; do
+			# Calculate total for this month
+			local_month_total=0
+			for b in "${BUCKET_LIST_MONTHS[@]}"; do
+				local_val="${MONTHS_MAP["$m|$b"]:-0	0}"
+				IFS=$'\t' read -r _s t <<< "$local_val"
+				(( local_month_total += t ))
+			done
+			printf '  %s%-10s%s ' "$BOLD" "$m" "$RESET"
+			if (( local_month_total > 0 && local_max_tokens > 0 )); then
+				# Scale bar to max month
+				local_pct_x100=$(( local_month_total * 10000 / local_max_tokens ))
+				local_pct_int=$(( local_pct_x100 / 100 ))
+				local_pct_dec=$(( local_pct_x100 % 100 ))
+				printf -v local_pct_str '%d.%02d' "$local_pct_int" "$local_pct_dec"
+				printf '%s %s\n' "$(make_bar "$local_pct_str")" "$(format_number "$local_month_total")"
+			else
+				printf '%s %s\n' "$(make_bar "0")" "0"
+			fi
+		done
+		printf '\n'
+	else
+		printf '\nMulti-month trends\n'
+		printf 'month\tbucket\tsessions\ttokens\n'
+		printf '%s\n' "$MONTHS_DATA"
 	fi
 fi
